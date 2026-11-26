@@ -408,6 +408,17 @@ impl StyledText {
         }
     }
 
+    /// Lay this text out into `layout` instead of a fresh [`TextLayout`].
+    ///
+    /// Pass a [`TextLayout::retained`] kept from the previous frame to reuse
+    /// its measurements: when the text and its resolved style are unchanged
+    /// and the same wrap width is asked for, the shaped lines are reused
+    /// instead of shaped and wrapped again.
+    pub fn with_layout(mut self, layout: TextLayout) -> Self {
+        self.layout = layout;
+        self
+    }
+
     /// Get the layout for this element. This can be used to map indices to pixels and vice versa.
     pub fn layout(&self) -> &TextLayout {
         &self.layout
@@ -611,11 +622,50 @@ impl IntoElement for StyledText {
 
 /// The Layout for TextElement. This can be used to map indices to pixels and vice versa.
 #[derive(Default, Clone)]
-pub struct TextLayout(Rc<RefCell<Option<TextLayoutInner>>>);
+pub struct TextLayout(
+    Rc<RefCell<Option<TextLayoutInner>>>,
+    /// `Some` for a [`TextLayout::retained`] layout: measurements that
+    /// outlive the frame that made them.
+    Rc<RefCell<Option<RetainedMeasurements>>>,
+);
+
+/// Measurements a retained [`TextLayout`] keeps across frames, valid while
+/// the inputs in `key` are unchanged. One entry per wrap width asked for: a
+/// flex layout probes the same text at several widths every frame.
+#[derive(Default)]
+struct RetainedMeasurements {
+    key: Option<TextLayoutKey>,
+    entries: SmallVec<[RetainedMeasurement; 2]>,
+}
+
+/// Everything besides the wrap width that shaping and wrapping depend on.
+#[derive(PartialEq)]
+struct TextLayoutKey {
+    text: SharedString,
+    runs: Vec<TextRun>,
+    font_size: Pixels,
+    line_height: Pixels,
+    white_space: WhiteSpace,
+    text_overflow: Option<TextOverflow>,
+    line_clamp: Option<usize>,
+}
+
+struct RetainedMeasurement {
+    wrap_width: Option<Pixels>,
+    len: usize,
+    lines: Rc<SmallVec<[WrappedLine; 1]>>,
+    size: Size<Pixels>,
+}
+
+/// Bound on the wrap widths remembered per text; more than this means the
+/// width is animating, and old entries will not be asked for again.
+const MAX_RETAINED_MEASUREMENTS: usize = 4;
 
 struct TextLayoutInner {
     len: usize,
-    lines: SmallVec<[WrappedLine; 1]>,
+    /// Shared so a retained layout can hand last frame's lines to this frame
+    /// without copying them.
+    lines: Rc<SmallVec<[WrappedLine; 1]>>,
     line_height: Pixels,
     wrap_width: Option<Pixels>,
     truncate_width: Option<Pixels>,
@@ -624,6 +674,16 @@ struct TextLayoutInner {
 }
 
 impl TextLayout {
+    /// A layout that keeps its measurements across frames. Hand the same one
+    /// to [`StyledText::with_layout`] every frame to skip re-shaping text
+    /// whose content, style and wrap width did not change.
+    pub fn retained() -> Self {
+        Self(
+            Rc::default(),
+            Rc::new(RefCell::new(Some(RetainedMeasurements::default()))),
+        )
+    }
+
     fn layout(
         &self,
         text: SharedString,
@@ -644,6 +704,27 @@ impl TextLayout {
         } else {
             vec![text_style.to_run(text.len())]
         };
+
+        // Every frame measures from scratch, as a fresh layout does: the
+        // in-frame cache below answers repeated probes within one layout
+        // pass and must not see the previous frame's result.
+        self.0.borrow_mut().take();
+        if let Some(retained) = self.1.borrow_mut().as_mut() {
+            let key = TextLayoutKey {
+                text: text.clone(),
+                runs: runs.clone(),
+                font_size,
+                line_height,
+                white_space: text_style.white_space,
+                text_overflow: text_style.text_overflow.clone(),
+                line_clamp: text_style.line_clamp,
+            };
+            if retained.key.as_ref() != Some(&key) {
+                retained.key = Some(key);
+                retained.entries.clear();
+            }
+        }
+
         window.request_measured_layout(Default::default(), {
             let element_state = self.clone();
 
@@ -691,6 +772,30 @@ impl TextLayout {
                     && text_layout.truncate_width.is_none()
                 {
                     return size;
+                }
+
+                // A retained layout answers a probe it already answered in an
+                // earlier frame with identical inputs (the key, checked in
+                // `layout`) and the identical wrap width, so the result is the
+                // one shaping would produce again. Truncation is excluded, as
+                // in the in-frame cache above.
+                if truncate_width.is_none()
+                    && let Some(retained) = element_state.1.borrow().as_ref()
+                    && let Some(hit) = retained
+                        .entries
+                        .iter()
+                        .find(|entry| entry.wrap_width == wrap_width)
+                {
+                    element_state.0.borrow_mut().replace(TextLayoutInner {
+                        lines: hit.lines.clone(),
+                        len: hit.len,
+                        line_height,
+                        wrap_width,
+                        truncate_width: None,
+                        size: Some(hit.size),
+                        bounds: None,
+                    });
+                    return hit.size;
                 }
 
                 let mut line_wrapper = cx.text_system().line_wrapper(text_style.font(), font_size);
@@ -764,6 +869,22 @@ impl TextLayout {
                     size.height += line_size.height;
                     size.width = size.width.max(line_size.width).ceil();
                 }
+                let lines = Rc::new(lines);
+
+                if truncate_width.is_none()
+                    && let Some(retained) = element_state.1.borrow_mut().as_mut()
+                {
+                    retained.entries.retain(|entry| entry.wrap_width != wrap_width);
+                    if retained.entries.len() >= MAX_RETAINED_MEASUREMENTS {
+                        retained.entries.remove(0);
+                    }
+                    retained.entries.push(RetainedMeasurement {
+                        wrap_width,
+                        len,
+                        lines: lines.clone(),
+                        size,
+                    });
+                }
 
                 element_state.0.borrow_mut().replace(TextLayoutInner {
                     lines,
@@ -803,7 +924,7 @@ impl TextLayout {
         let line_height = element_state.line_height;
         let mut line_origin = bounds.origin;
         let text_style = window.text_style();
-        for line in &element_state.lines {
+        for line in element_state.lines.iter() {
             line.paint_background(
                 line_origin,
                 line_height,
@@ -843,7 +964,7 @@ impl TextLayout {
         let line_height = element_state.line_height;
         let mut line_origin = bounds.origin;
         let mut line_start_ix = 0;
-        for line in &element_state.lines {
+        for line in element_state.lines.iter() {
             let line_bottom = line_origin.y + line.size(line_height).height;
             if position.y > line_bottom {
                 line_origin.y = line_bottom;
@@ -874,7 +995,7 @@ impl TextLayout {
         let mut line_origin = bounds.origin;
         let mut line_start_ix = 0;
 
-        for line in &element_state.lines {
+        for line in element_state.lines.iter() {
             let line_end_ix = line_start_ix + line.len();
             if index < line_start_ix {
                 break;
@@ -899,7 +1020,7 @@ impl TextLayout {
             .expect("measurement has not been performed");
         let mut line_start_ix = 0;
 
-        for line in &element_state.lines {
+        for line in element_state.lines.iter() {
             let line_end_ix = line_start_ix + line.len();
             if index < line_start_ix {
                 break;
@@ -1309,5 +1430,72 @@ mod tests {
             make_text_unstable_id(false).id,
             make_text_unstable_id(true).id
         );
+    }
+
+    /// Draws `text` at `width` into `layout` and returns the measured size and
+    /// the identity of the line storage the frame ended up with.
+    fn draw_text(
+        cx: &mut crate::VisualTestContext,
+        layout: &TextLayout,
+        text: &'static str,
+        width: Pixels,
+    ) -> (Size<Pixels>, *const SmallVec<[WrappedLine; 1]>) {
+        use crate::{ParentElement as _, Styled as _, div, point, px, size};
+        let element_layout = layout.clone();
+        cx.draw(point(px(0.), px(0.)), size(width, px(400.)), move |_, _| {
+            div()
+                .w(width)
+                .child(StyledText::new(text).with_layout(element_layout))
+        });
+        let inner = layout.0.borrow();
+        let inner = inner.as_ref().expect("text was measured");
+        (inner.size.unwrap(), Rc::as_ptr(&inner.lines))
+    }
+
+    #[crate::test]
+    fn retained_layout_reuses_unchanged_measurements(cx: &mut crate::TestAppContext) {
+        use crate::px;
+        let cx = cx.add_empty_window();
+        let text = "a sentence long enough to wrap at a narrow width";
+
+        let retained = TextLayout::retained();
+        let (first, first_lines) = draw_text(cx, &retained, text, px(80.));
+        let (second, second_lines) = draw_text(cx, &retained, text, px(80.));
+        assert_eq!(first, second);
+        assert_eq!(
+            first_lines, second_lines,
+            "an unchanged frame should reuse the shaped lines, not shape again"
+        );
+
+        // Same result as a layout that keeps nothing across frames.
+        let (fresh, _) = draw_text(cx, &TextLayout::default(), text, px(80.));
+        assert_eq!(second, fresh);
+    }
+
+    #[crate::test]
+    fn retained_layout_remeasures_changed_inputs(cx: &mut crate::TestAppContext) {
+        use crate::px;
+        let cx = cx.add_empty_window();
+        let long = "a sentence long enough to wrap at a narrow width";
+
+        let retained = TextLayout::retained();
+        let (narrow, narrow_lines) = draw_text(cx, &retained, long, px(80.));
+
+        // A new wrap width is measured, and matches a fresh layout.
+        let (wide, wide_lines) = draw_text(cx, &retained, long, px(400.));
+        assert_ne!(narrow_lines, wide_lines);
+        assert!(wide.height < narrow.height);
+        assert_eq!(wide, draw_text(cx, &TextLayout::default(), long, px(400.)).0);
+
+        // Going back to a remembered width reuses that measurement.
+        let (narrow_again, narrow_again_lines) = draw_text(cx, &retained, long, px(80.));
+        assert_eq!(narrow_again, narrow);
+        assert_eq!(narrow_again_lines, narrow_lines);
+
+        // New text invalidates every remembered measurement.
+        let (short, short_lines) = draw_text(cx, &retained, "short", px(80.));
+        assert_ne!(short_lines, narrow_lines);
+        assert_eq!(short, draw_text(cx, &TextLayout::default(), "short", px(80.)).0);
+        assert!(short.height < narrow.height);
     }
 }
