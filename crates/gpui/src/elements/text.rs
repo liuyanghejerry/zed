@@ -641,6 +641,9 @@ struct RetainedMeasurements {
 /// Everything besides the wrap width that shaping and wrapping depend on.
 #[derive(PartialEq)]
 struct TextLayoutKey {
+    /// A family can resolve to another font once fonts are added; the runs
+    /// below name fonts, they do not pin the resolved face.
+    font_generation: u64,
     text: SharedString,
     runs: Vec<TextRun>,
     font_size: Pixels,
@@ -711,6 +714,7 @@ impl TextLayout {
         self.0.borrow_mut().take();
         if let Some(retained) = self.1.borrow_mut().as_mut() {
             let key = TextLayoutKey {
+                font_generation: window.text_system().font_generation(),
                 text: text.clone(),
                 runs: runs.clone(),
                 font_size,
@@ -1497,5 +1501,25 @@ mod tests {
         assert_ne!(short_lines, narrow_lines);
         assert_eq!(short, draw_text(cx, &TextLayout::default(), "short", px(80.)).0);
         assert!(short.height < narrow.height);
+    }
+
+    #[crate::test]
+    fn retained_layout_remeasures_after_fonts_are_added(cx: &mut crate::TestAppContext) {
+        use crate::px;
+        let cx = cx.add_empty_window();
+        let text = "a family may resolve to another face once fonts are added";
+
+        let retained = TextLayout::retained();
+        let (_, before) = draw_text(cx, &retained, text, px(80.));
+        let (_, unchanged) = draw_text(cx, &retained, text, px(80.));
+        assert_eq!(before, unchanged);
+
+        cx.update(|_, cx| cx.text_system().add_fonts(Vec::new()))
+            .expect("adding no fonts succeeds");
+        let (_, after) = draw_text(cx, &retained, text, px(80.));
+        assert_ne!(
+            before, after,
+            "adding fonts must invalidate measurements keyed by family name"
+        );
     }
 }

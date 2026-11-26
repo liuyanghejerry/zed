@@ -56,6 +56,10 @@ pub struct TextSystem {
     wrapper_pool: Mutex<FxHashMap<FontIdWithSize, Vec<LineWrapper>>>,
     font_runs_pool: Mutex<Vec<Vec<FontRun>>>,
     fallback_font_stack: SmallVec<[Font; 2]>,
+    /// Bumped by every [`TextSystem::add_fonts`]. A family name can resolve
+    /// to a different font once its file is added, so anything that caches
+    /// layout by font *name* must also key on this.
+    font_generation: std::sync::atomic::AtomicU64,
 }
 
 impl TextSystem {
@@ -81,6 +85,7 @@ impl TextSystem {
                 font("DejaVu Sans"),
                 font("Arial"), // macOS, Windows
             ],
+            font_generation: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -106,7 +111,15 @@ impl TextSystem {
         self.font_ids_by_font
             .write()
             .retain(|_, font_id| font_id.is_ok());
+        self.font_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Changes whenever fonts are added. See the `font_generation` field.
+    pub fn font_generation(&self) -> u64 {
+        self.font_generation
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Get the FontId for the configure font family and style.
